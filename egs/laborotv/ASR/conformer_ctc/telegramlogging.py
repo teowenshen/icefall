@@ -17,8 +17,8 @@ class TelegramStreamIO(logging.Handler):
 
     def __init__(self):
         super(TelegramStreamIO, self).__init__()
-        token = '2033198046:AAG-k77HX1XJzcm33DHWE8G6g4hdxvV6fCc'
-        self.chat_id = '1976736656'
+        token = 'xxxxxx'
+        self.chat_id = 'xxx'
         self.url = f'{self.API_ENDPOINT}/bot{token}/sendMessage'
 
     
