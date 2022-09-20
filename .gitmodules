@@ -1,0 +1,3 @@
+[submodule "egs/csj/ASR/CSJSDB_Parser"]
+	path = egs/csj/ASR/CSJSDB_Parser
+	url = https://github.com/Minami-Lab-UEC/CSJSDB_Parser.git
