@@ -66,15 +66,14 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import k2
 import optim
-import sentencepiece as spm
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
+from asr_datamodule import CSJAsrDataModule
 from decoder import Decoder
 from emformer import Emformer
 from joiner import Joiner
-from lhotse.cut import Cut
+from lhotse.cut import Cut, CutSet
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
 from model import Transducer
@@ -94,6 +93,61 @@ from icefall.checkpoint import (
 from icefall.dist import cleanup_dist, setup_dist
 from icefall.env import get_env_info
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
+
+import requests
+import logging, logging.handlers
+
+def escape_html(text : str):
+    """
+    Escapes all html characters in text
+    :param str text:
+    :rtype: str
+    """
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+class TelegramStreamIO(logging.Handler):
+
+    API_ENDPOINT = 'https://api.telegram.org'
+    MAX_MESSAGE_LEN = 4096
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s at %(funcName)s (line %(lineno)s):\n\n%(message)s')
+
+    def __init__(self):
+        super(TelegramStreamIO, self).__init__()
+        token = '' # 'xxx'
+        self.chat_id = '' #'1976736656'
+        self.url = f'{self.API_ENDPOINT}/bot{token}/sendMessage'
+
+    
+    def emit(self, record : logging.LogRecord):
+        """
+        Emit a record.
+        Send the record to the Web server as a percent-encoded dictionary
+        """
+        data = {
+            'chat_id': self.chat_id,
+            'text': self.format(self.mapLogRecord(record)),
+            'parse_mode': 'HTML'
+        }
+        try:
+            requests.get(self.url, json=data)
+            #return response.json()
+        except:
+            print("LOL TelegramStreamIO failed to send message")
+            pass
+
+
+
+    def mapLogRecord(self, record):
+        """
+        Default implementation of mapping the log record into a dict
+        that is sent as the CGI data. Overwrite in your class.
+        Contributed by Franz Glasner.
+        """
+
+        for k, v in record.__dict__.items():
+            if isinstance(v, str):
+                setattr(record, k, escape_html(v))
+        return record
 
 LRSchedulerType = Union[
     torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler
@@ -174,6 +228,18 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Use hardcoded arguments"
+    )
+
+    parser.add_argument(
+        "--use-telegram",
+        action="store_true",
+        help="Notify warnings via telegram"
+    )
+
+    parser.add_argument(
         "--world-size",
         type=int,
         default=1,
@@ -222,8 +288,8 @@ def get_parser():
 
     parser.add_argument(
         "--exp-dir",
-        type=str,
-        default="pruned_transducer_stateless2/exp",
+        type=Path,
+        default="conv_emformer_transducer_stateless2/exp",
         help="""The experiment dir.
         It specifies the directory where all training related
         files, e.g., checkpoints, log, etc, are saved
@@ -231,10 +297,10 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--bpe-model",
-        type=str,
-        default="data/lang_bpe_500/bpe.model",
-        help="Path to the BPE model",
+        "--lang-dir",
+        type=Path,
+        default="lang_char",
+        help="Path to the lang_dir",
     )
 
     parser.add_argument(
@@ -613,7 +679,7 @@ def save_checkpoint(
 def compute_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    sp: spm.SentencePieceProcessor,
+    sym2id: k2.SymbolTable,
     batch: dict,
     is_training: bool,
     warmup: float = 1.0,
@@ -650,7 +716,11 @@ def compute_loss(
     feature_lens = supervisions["num_frames"].to(device)
 
     texts = batch["supervisions"]["text"]
-    y = sp.encode(texts, out_type=int)
+
+    y = [
+        [sym2id[w] for w in t_b.split(' ') if w ] for t_b in texts
+    ]
+
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
@@ -706,7 +776,7 @@ def compute_loss(
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    sp: spm.SentencePieceProcessor,
+    sym2id: k2.SymbolTable,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
 ) -> MetricsTracker:
@@ -719,7 +789,7 @@ def compute_validation_loss(
         loss, loss_info = compute_loss(
             params=params,
             model=model,
-            sp=sp,
+            sym2id=sym2id,
             batch=batch,
             is_training=False,
         )
@@ -742,7 +812,7 @@ def train_one_epoch(
     model: Union[nn.Module, DDP],
     optimizer: torch.optim.Optimizer,
     scheduler: LRSchedulerType,
-    sp: spm.SentencePieceProcessor,
+    sym2id: k2.SymbolTable,
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     scaler: GradScaler,
@@ -800,7 +870,7 @@ def train_one_epoch(
             loss, loss_info = compute_loss(
                 params=params,
                 model=model,
-                sp=sp,
+                sym2id=sym2id,
                 batch=batch,
                 is_training=True,
                 warmup=(params.batch_idx_train / params.model_warm_step),
@@ -856,6 +926,14 @@ def train_one_epoch(
 
         if batch_idx % params.log_interval == 0:
             cur_lr = scheduler.get_last_lr()[0]
+            if batch_idx % 5000 == 0:
+                logging.warning(
+                    f"Epoch {params.cur_epoch}, "
+                    f"batch {batch_idx}: \n"
+                    f"tot_loss[{tot_loss}], batch size: {batch_size}, "
+                    f"lr: {cur_lr:.2e}"
+                )
+
             logging.info(
                 f"Epoch {params.cur_epoch}, "
                 f"batch {batch_idx}, loss[{loss_info}], "
@@ -880,12 +958,16 @@ def train_one_epoch(
             valid_info = compute_validation_loss(
                 params=params,
                 model=model,
-                sp=sp,
+                sym2id=sym2id,
                 valid_dl=valid_dl,
                 world_size=world_size,
             )
             model.train()
-            logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
+            if batch_idx % (params.valid_interval * 5) == 0:
+                log_mode = logging.warn
+            else:
+                log_mode = logging.info
+            log_mode(f"Epoch {params.cur_epoch}, validation: {valid_info}")
             if tb_writer is not None:
                 valid_info.write_summary(
                     tb_writer, "train/valid_", params.batch_idx_train
@@ -912,7 +994,7 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
-    if params.full_libri is False:
+    if not params.noncore:
         params.valid_interval = 1600
 
     fix_random_seed(params.seed)
@@ -920,7 +1002,13 @@ def run(rank, world_size, args):
         setup_dist(rank, world_size, params.master_port)
 
     setup_logger(f"{params.exp_dir}/log/log-train")
-    logging.info("Training started")
+    if args.use_telegram:
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s at %(funcName)s (line %(lineno)s) - %(message)s')
+        tg = TelegramStreamIO()
+        tg.setLevel(logging.WARN)
+        tg.setFormatter(formatter)
+        logging.getLogger("").addHandler(tg)
+    logging.warning("Training started")
 
     if args.tensorboard and rank == 0:
         tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
@@ -932,12 +1020,12 @@ def run(rank, world_size, args):
         device = torch.device("cuda", rank)
     logging.info(f"Device: {device}")
 
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
+
+    sym2id = k2.SymbolTable.from_file(args.lang_dir / "words.txt")
 
     # <blk> is defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.vocab_size = sp.get_piece_size()
+    params.blank_id = sym2id['<blk>']
+    params.vocab_size = len(sym2id)
 
     logging.info(params)
 
@@ -985,12 +1073,7 @@ def run(rank, world_size, args):
         )  # allow 4 megabytes per sub-module
         diagnostic = diagnostics.attach_diagnostics(model, opts)
 
-    librispeech = LibriSpeechAsrDataModule(args)
-
-    train_cuts = librispeech.train_clean_100_cuts()
-    if params.full_libri:
-        train_cuts += librispeech.train_clean_360_cuts()
-        train_cuts += librispeech.train_other_500_cuts()
+    csj_corpus = CSJAsrDataModule(args)
 
     def remove_short_and_long_utt(c: Cut):
         # Keep only utterances with duration between 1 second and 20 seconds
@@ -1003,6 +1086,22 @@ def run(rank, world_size, args):
         # the threshold
         return 1.0 <= c.duration <= 20.0
 
+    choices = {"eval1", "eval2", "eval3"}
+    assert len(args.testset) < 3, "At least one dataset must be left for validation."
+    for c in args.testset:
+        choices.remove(c)
+
+    valid_cuts = CutSet()
+    for subdir in choices:
+        valid_cuts += getattr(csj_corpus, f"{subdir}_cuts")()
+
+    valid_cuts = valid_cuts.filter(remove_short_and_long_utt)
+    valid_dl = csj_corpus.valid_dataloaders(valid_cuts)
+
+    train_cuts = csj_corpus.core_cuts()
+    if params.noncore:
+        train_cuts += csj_corpus.noncore_cuts()
+
     train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
     if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
@@ -1012,20 +1111,16 @@ def run(rank, world_size, args):
     else:
         sampler_state_dict = None
 
-    train_dl = librispeech.train_dataloaders(
+    train_dl = csj_corpus.train_dataloaders(
         train_cuts, sampler_state_dict=sampler_state_dict
     )
-
-    valid_cuts = librispeech.dev_clean_cuts()
-    valid_cuts += librispeech.dev_other_cuts()
-    valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
     if not params.print_diagnostics:
         scan_pessimistic_batches_for_oom(
             model=model,
             train_dl=train_dl,
             optimizer=optimizer,
-            sp=sp,
+            sym2id=sym2id,
             params=params,
         )
 
@@ -1034,7 +1129,7 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
-    for epoch in range(params.start_epoch, params.num_epochs + 1):
+    for epoch in range(params.start_epoch, params.start_epoch + params.num_epochs):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
         train_dl.sampler.set_epoch(epoch - 1)
@@ -1050,7 +1145,7 @@ def run(rank, world_size, args):
             model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
-            sp=sp,
+            sym2id=sym2id,
             train_dl=train_dl,
             valid_dl=valid_dl,
             scaler=scaler,
@@ -1074,7 +1169,7 @@ def run(rank, world_size, args):
             rank=rank,
         )
 
-    logging.info("Done!")
+    logging.warning("Done!")
 
     if world_size > 1:
         torch.distributed.barrier()
@@ -1085,7 +1180,7 @@ def scan_pessimistic_batches_for_oom(
     model: Union[nn.Module, DDP],
     train_dl: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    sp: spm.SentencePieceProcessor,
+    sym2id: k2.SymbolTable,
     params: AttributeDict,
 ):
     from lhotse.dataset import find_pessimistic_batches
@@ -1104,7 +1199,7 @@ def scan_pessimistic_batches_for_oom(
                 loss, _ = compute_loss(
                     params=params,
                     model=model,
-                    sp=sp,
+                    sym2id=sym2id,
                     batch=batch,
                     is_training=True,
                     warmup=0.0,
@@ -1126,8 +1221,20 @@ def scan_pessimistic_batches_for_oom(
 
 def main():
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
+    CSJAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
+
+    if args.debug:
+        args.testset = ["eval2"]
+        args.world_size = 1
+        args.noncore = True
+        args.max_duration = 150
+        args.start_epoch = 22 
+        args.num_epochs = 7
+        args.lang_dir = Path("lang_char")
+        args.manifest_dir = Path("data/manifests")
+        args.musan_dir = Path("/mnt/minami_data_server/t2131178/corpus/musan/musan/fbank")
+
     args.exp_dir = Path(args.exp_dir)
 
     world_size = args.world_size

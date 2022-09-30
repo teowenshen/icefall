@@ -25,16 +25,16 @@ for usage.
 """
 
 
+from pathlib import Path
 from lhotse import load_manifest
 
 
 def main():
-    path = "./data/fbank/cuts_train.json.gz"
-    # path = "./data/fbank/cuts_dev.json.gz"
-    # path = "./data/fbank/cuts_test.json.gz"
+    for path in Path("data/manifests").glob("cuts_*.jsonl.gz"):
 
-    cuts = load_manifest(path)
-    cuts.describe()
+        cuts = load_manifest(path)
+        print(path.name)
+        cuts.describe()
 
 
 if __name__ == "__main__":

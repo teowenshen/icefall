@@ -43,8 +43,8 @@ torch.set_num_interop_threads(1)
 
 
 def compute_fbank_musan(manifest_dir : Path, fbank_dir : Path, num_jobs = 4, num_mel_bins=80):
-    manifest_dir = Path("data/manifests")
-    fbank_dir = Path("data/fbank")
+    #manifest_dir = Path("data/manifests")
+    #fbank_dir = Path("data/fbank")
     num_jobs = min(num_jobs, os.cpu_count())
     #num_mel_bins = 80
 
@@ -106,9 +106,9 @@ def get_args():
              TODO"""
     )
     
-    parser.add_argument("--manifest-dir", type=str,
+    parser.add_argument("--manifest-dir", type=Path,
                         help="Path to save manifests")    
-    parser.add_argument("--fbank-dir", type=str,
+    parser.add_argument("--fbank-dir", type=Path,
                         help="Path to save fbank features")    
     parser.add_argument("--debug", action="store_true",
                         help="Use hardcoded parameters")
@@ -119,8 +119,8 @@ if __name__ == "__main__":
     args = get_args()
 
     if args.debug:
-        args.manifest_dir = "/mnt/minami_data_server/t2131178/corpus/musan/musan/manifests"
-        args.fbank_dir = "/mnt/minami_data_server/t2131178/corpus/musan/musan/fbank"
+        args.manifest_dir = Path("/mnt/minami_data_server/t2131178/corpus/musan/musan/manifests")
+        args.fbank_dir = Path("/mnt/minami_data_server/t2131178/corpus/musan/musan/fbank")
 
     formatter = (
         "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"

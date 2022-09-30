@@ -52,7 +52,7 @@ class _SeedWorkers:
         fix_random_seed(self.seed + worker_id)
 
 
-class LibriSpeechAsrDataModule:
+class CSJAsrDataModule:
     """
     DataModule for k2 ASR experiments.
     It assumes there is always one train and valid dataloader,
@@ -83,17 +83,29 @@ class LibriSpeechAsrDataModule:
             "augmentations, etc.",
         )
         group.add_argument(
-            "--full-libri",
-            type=str2bool,
-            default=True,
-            help="When enabled, use 960h LibriSpeech. "
-            "Otherwise, use 100h subset.",
+            "--testset",
+            type=str,
+            default=["eval2"],
+            nargs="+",
+            choices={"eval1", "eval2", "eval3"},
+            help="eval set to use as test. "
+            "The others will be used as evaluation. ",
+        )
+        group.add_argument(
+            "--noncore",
+            action="store_true", 
+            help="Use this flag to include noncore subdir in training corpus. "
         )
         group.add_argument(
             "--manifest-dir",
             type=Path,
             default=Path("data/fbank"),
             help="Path to directory with train/valid/test cuts.",
+        )
+        group.add_argument(
+            "--musan-dir",
+            type=Path,
+            help="Path to directory with musan cuts. "
         )
         group.add_argument(
             "--max-duration",
@@ -208,6 +220,13 @@ class LibriSpeechAsrDataModule:
             help="AudioSamples or PrecomputedFeatures",
         )
 
+        group.add_argument(
+            "--test-perturb",
+            action="store_true",
+            help="Whether to remove recordings with perturbed speeds from "
+            "test dataset. Removes by default."
+        )
+
     def train_dataloaders(
         self,
         cuts_train: CutSet,
@@ -225,7 +244,7 @@ class LibriSpeechAsrDataModule:
             logging.info("Enable MUSAN")
             logging.info("About to get Musan cuts")
             cuts_musan = load_manifest(
-                self.args.manifest_dir / "musan_cuts.jsonl.gz"
+                self.args.musan_dir / "musan_cuts.jsonl.gz"
             )
             transforms.append(
                 CutMix(
@@ -384,6 +403,13 @@ class LibriSpeechAsrDataModule:
 
     def test_dataloaders(self, cuts: CutSet) -> DataLoader:
         logging.debug("About to create test dataset")
+
+        # if not self.args.test_perturb:
+        #     cuts = cuts.filter
+        #     cuts = CutSet.from_cuts(
+        #         [c for c in cuts if c.id[-6:-3] != '_sp']
+        #     )
+
         test = K2SpeechRecognitionDataset(
             input_strategy=OnTheFlyFeatures(Fbank(FbankConfig(num_mel_bins=80)))
             if self.args.on_the_fly_feats
@@ -395,6 +421,11 @@ class LibriSpeechAsrDataModule:
             max_duration=self.args.max_duration,
             shuffle=False,
         )
+
+        if not self.args.test_perturb:
+            sampler.filter(lambda c: c.id[-6:-3] != '_sp')
+
+
         logging.debug("About to create test dataloader")
         test_dl = DataLoader(
             test,
@@ -405,50 +436,36 @@ class LibriSpeechAsrDataModule:
         return test_dl
 
     @lru_cache()
-    def train_clean_100_cuts(self) -> CutSet:
-        logging.info("About to get train-clean-100 cuts")
+    def core_cuts(self) -> CutSet:
+        logging.info("About to get core cuts")
         return load_manifest_lazy(
-            self.args.manifest_dir / "librispeech_cuts_train-clean-100.jsonl.gz"
+            self.args.manifest_dir / "cuts_core.jsonl.gz"
         )
 
     @lru_cache()
-    def train_clean_360_cuts(self) -> CutSet:
-        logging.info("About to get train-clean-360 cuts")
+    def noncore_cuts(self) -> CutSet:
+        logging.info("About to get noncore cuts")
         return load_manifest_lazy(
-            self.args.manifest_dir / "librispeech_cuts_train-clean-360.jsonl.gz"
+            self.args.manifest_dir / "cuts_noncore.jsonl.gz"
         )
 
     @lru_cache()
-    def train_other_500_cuts(self) -> CutSet:
-        logging.info("About to get train-other-500 cuts")
+    def eval1_cuts(self) -> CutSet:
+        logging.info("About to get eval1 cuts")
         return load_manifest_lazy(
-            self.args.manifest_dir / "librispeech_cuts_train-other-500.jsonl.gz"
+            self.args.manifest_dir / "cuts_eval1.jsonl.gz"
         )
 
     @lru_cache()
-    def dev_clean_cuts(self) -> CutSet:
-        logging.info("About to get dev-clean cuts")
+    def eval2_cuts(self) -> CutSet:
+        logging.info("About to get eval2 cuts")
         return load_manifest_lazy(
-            self.args.manifest_dir / "librispeech_cuts_dev-clean.jsonl.gz"
+            self.args.manifest_dir / "cuts_eval2.jsonl.gz"
         )
 
     @lru_cache()
-    def dev_other_cuts(self) -> CutSet:
-        logging.info("About to get dev-other cuts")
+    def eval3_cuts(self) -> CutSet:
+        logging.info("About to get eval3 cuts")
         return load_manifest_lazy(
-            self.args.manifest_dir / "librispeech_cuts_dev-other.jsonl.gz"
-        )
-
-    @lru_cache()
-    def test_clean_cuts(self) -> CutSet:
-        logging.info("About to get test-clean cuts")
-        return load_manifest_lazy(
-            self.args.manifest_dir / "librispeech_cuts_test-clean.jsonl.gz"
-        )
-
-    @lru_cache()
-    def test_other_cuts(self) -> CutSet:
-        logging.info("About to get test-other cuts")
-        return load_manifest_lazy(
-            self.args.manifest_dir / "librispeech_cuts_test-other.jsonl.gz"
+            self.args.manifest_dir / "cuts_eval3.jsonl.gz"
         )

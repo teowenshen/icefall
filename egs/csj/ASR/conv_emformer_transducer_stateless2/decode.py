@@ -80,7 +80,7 @@ import k2
 import sentencepiece as spm
 import torch
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
+from asr_datamodule import CSJAsrDataModule
 from beam_search import (
     beam_search,
     fast_beam_search_one_best,
@@ -104,12 +104,20 @@ from icefall.utils import (
     write_error_stats,
 )
 
+from lhotse import CutSet
+
 LOG_EPS = math.log(1e-10)
 
 
 def get_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Use hardcoded arguments"
     )
 
     parser.add_argument(
@@ -154,21 +162,22 @@ def get_parser():
     parser.add_argument(
         "--exp-dir",
         type=str,
-        default="pruned_transducer_stateless4/exp",
+        default="conv_emformer_transducer_stateless2/exp",
         help="The experiment dir",
     )
 
     parser.add_argument(
-        "--bpe-model",
-        type=str,
-        default="data/lang_bpe_500/bpe.model",
-        help="Path to the BPE model",
+        "--lang-dir",
+        type=Path,
+        default="lang_char",
+        help="Path to the lang_dir",
     )
 
     parser.add_argument(
         "--decoding-method",
         type=str,
         default="greedy_search",
+        choices={"greedy_search", "modified_beam_search", "fast_beam_search"},
         help="""Possible values are:
           - greedy_search
           - modified_beam_search
@@ -235,7 +244,7 @@ def get_parser():
 def decode_one_batch(
     params: AttributeDict,
     model: nn.Module,
-    sp: spm.SentencePieceProcessor,
+    sym2id : k2.SymbolTable,
     batch: dict,
     decoding_graph: Optional[k2.Fsa] = None,
 ) -> Dict[str, List[List[str]]]:
@@ -254,8 +263,8 @@ def decode_one_batch(
         It's the return value of :func:`get_params`.
       model:
         The neural model.
-      sp:
-        The BPE model.
+      sym2id:
+        The SymbolTable for output words.
       batch:
         It is the return value from iterating
         `lhotse.dataset.K2SpeechRecognitionDataset`. See its documentation
@@ -299,8 +308,9 @@ def decode_one_batch(
             max_contexts=params.max_contexts,
             max_states=params.max_states,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
+
+        hyps.extend( [ sym2id[w] for w in t_b ] for t_b in hyp_tokens )
+
     elif (
         params.decoding_method == "greedy_search"
         and params.max_sym_per_frame == 1
@@ -310,8 +320,7 @@ def decode_one_batch(
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
+        hyps.extend( [ sym2id[w] for w in t_b ] for t_b in hyp_tokens )
     elif params.decoding_method == "modified_beam_search":
         hyp_tokens = modified_beam_search(
             model=model,
@@ -319,8 +328,7 @@ def decode_one_batch(
             encoder_out_lens=encoder_out_lens,
             beam=params.beam_size,
         )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
+        hyps.extend( [ sym2id[w] for w in t_b ] for t_b in hyp_tokens )
     else:
         batch_size = encoder_out.size(0)
 
@@ -344,7 +352,7 @@ def decode_one_batch(
                 raise ValueError(
                     f"Unsupported decoding method: {params.decoding_method}"
                 )
-            hyps.append(sp.decode(hyp).split())
+            hyps.append( [ sym2id[w] for w in hyp ] )
 
     if params.decoding_method == "greedy_search":
         return {"greedy_search": hyps}
@@ -364,7 +372,7 @@ def decode_dataset(
     dl: torch.utils.data.DataLoader,
     params: AttributeDict,
     model: nn.Module,
-    sp: spm.SentencePieceProcessor,
+    sym2id : k2.SymbolTable,
     decoding_graph: Optional[k2.Fsa] = None,
 ) -> Dict[str, List[Tuple[List[str], List[str]]]]:
     """Decode dataset.
@@ -408,7 +416,7 @@ def decode_dataset(
         hyps_dict = decode_one_batch(
             params=params,
             model=model,
-            sp=sp,
+            sym2id=sym2id,
             decoding_graph=decoding_graph,
             batch=batch,
         )
@@ -481,7 +489,7 @@ def save_results(
 @torch.no_grad()
 def main():
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
+    CSJAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 
@@ -525,13 +533,13 @@ def main():
 
     logging.info(f"Device: {device}")
 
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
+    sym2id = k2.SymbolTable.from_file(args.lang_dir / "words.txt" )
 
-    # <blk> and <unk> is defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.unk_id = sp.piece_to_id("<unk>")
-    params.vocab_size = sp.get_piece_size()
+    # <blk> and <unk> are defined in local/train_bpe_model.py
+    params.blank_id = sym2id['<blk>']
+    params.vocab_size = len(sym2id)
+    #params.unk_id = sp.piece_to_id("<unk>")
+    #params.vocab_size = sp.get_piece_size()
 
     logging.info(params)
 
@@ -628,29 +636,23 @@ def main():
 
     # we need cut ids to display recognition results.
     args.return_cuts = True
-    librispeech = LibriSpeechAsrDataModule(args)
+    csj_corpus = CSJAsrDataModule(args)
 
-    test_clean_cuts = librispeech.test_clean_cuts()
-    test_other_cuts = librispeech.test_other_cuts()
-
-    test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
-    test_other_dl = librispeech.test_dataloaders(test_other_cuts)
-
-    test_sets = ["test-clean", "test-other"]
-    test_dl = [test_clean_dl, test_other_dl]
-
-    for test_set, test_dl in zip(test_sets, test_dl):
+    for subdir in args.testset:
+        test_dl = csj_corpus.test_dataloaders(
+            getattr(csj_corpus, f"{subdir}_cuts")()
+        )
         results_dict = decode_dataset(
             dl=test_dl,
             params=params,
             model=model,
-            sp=sp,
-            decoding_graph=decoding_graph,
+            sym2id=sym2id,
+            decoding_graph=decoding_graph
         )
 
         save_results(
             params=params,
-            test_set_name=test_set,
+            test_set_name=subdir,
             results_dict=results_dict,
         )
 

@@ -78,7 +78,7 @@ import numpy as np
 import sentencepiece as spm
 import torch
 import torch.nn as nn
-from asr_datamodule import LibriSpeechAsrDataModule
+from asr_datamodule import CSJAsrDataModule
 from beam_search import Hypothesis, HypothesisList, get_hyps_shape
 from emformer import LOG_EPSILON, stack_states, unstack_states
 from kaldifeat import Fbank, FbankOptions
@@ -801,7 +801,7 @@ def save_results(
 @torch.no_grad()
 def main():
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
+    CSJAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 
@@ -952,9 +952,9 @@ def main():
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
-    librispeech = LibriSpeechAsrDataModule(args)
+    librispeech = CSJAsrDataModule(args)
 
-    test_clean_cuts = librispeech.test_clean_cuts()
+    test_clean_cuts = librispeech.eval3_cuts()
     test_other_cuts = librispeech.test_other_cuts()
 
     test_sets = ["test-clean", "test-other"]

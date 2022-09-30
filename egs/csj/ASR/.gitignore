@@ -1,3 +1,6 @@
 librispeech_*.*
 todelete*
-lang_ori/*
+lang*
+telegramlogging.py
+results.ipynb
+notify_tg.py
